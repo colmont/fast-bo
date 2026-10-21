@@ -1,0 +1,1373 @@
+diff --git a/MCBO/mcbo/acq_optimizers/fast_bo_acq_optimizers.py b/MCBO/mcbo/acq_optimizers/fast_bo_acq_optimizers.py
+new file mode 100644
+index 0000000..6d8fbf7
+--- /dev/null
++++ b/MCBO/mcbo/acq_optimizers/fast_bo_acq_optimizers.py
+@@ -0,0 +1,351 @@
++# This program is free software; you can redistribute it and/or modify it under
++# the terms of the MIT license.
++
++# This program is distributed in the hope that it will be useful, but WITHOUT ANY
++# WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
++# PARTICULAR PURPOSE. See the MIT License for more details.
++
++r"""
++Acquisition optimizers for Fast BO on categorical inputs (``OneHotBLRModel``).
++
++A linear function of one-hot features separates over the variables, so we can minimize
++it exactly by taking the best category of each variable. In a Hamming trust region of
++radius r, only the r variables with the largest gain change. TS minimizes one such
++function. For LCB and EI we linearize the posterior std and repeat (majorize-minimize).
++Everything is minimized, as in MCBO. phi are the one-hot features (M of them).
++"""
++
++import math
++from typing import Callable, Dict, List, Optional, Union
++
++import numpy as np
++import torch
++
++from mcbo.acq_funcs.acq_base import AcqBase
++from mcbo.acq_funcs.ei import EI
++from mcbo.acq_funcs.lcb import LCB
++from mcbo.acq_optimizers.acq_optimizer_base import AcqOptimizerBase
++from mcbo.models import ModelBase
++from mcbo.models.linear_reagression.onehot_blr import OneHotBLRModel
++from mcbo.search_space import SearchSpace
++from mcbo.trust_region import TrManagerBase
++from mcbo.utils.plot_resource_utils import COLORS_SNS_10, get_color
++
++# Number of random points to try when all single flips were already observed
++N_FALLBACK = 64
++
++
++def features(cats: np.ndarray, offsets: List[int], width: int, dtype, device) -> torch.Tensor:
++    """ One-hot features of category indices. """
++    phi = torch.zeros((len(cats), width), dtype=dtype, device=device)
++    indices = torch.as_tensor(np.asarray(offsets[:-1])[None, :] + cats, device=device)
++    phi.scatter_(1, indices, 1.0)
++    return phi
++
++
++def linear_minima(weights: torch.Tensor, centre: np.ndarray, offsets: List[int], radius: int) -> np.ndarray:
++    """ Minimize ``weights @ phi`` exactly over the Hamming ball, for each row of weights. """
++    best, gains = [], []
++    for j in range(len(centre)):
++        block = weights[:, offsets[j]:offsets[j + 1]]
++        choice = block.argmin(1)
++        best.append(choice)
++        gains.append(block[:, int(centre[j])] - block.gather(1, choice[:, None]).squeeze(1))
++    cats = torch.stack(best, 1).cpu().numpy()
++    if radius >= len(centre):
++        return cats
++    result = np.broadcast_to(centre, cats.shape).copy()
++    if radius > 0:
++        order = np.argsort(-torch.stack(gains, 1).cpu().numpy(), axis=1)[:, :radius]
++        rows = np.arange(len(cats))[:, None]
++        result[rows, order] = cats[rows, order]
++    return result
++
++
++def inverse_mills(gamma: torch.Tensor) -> torch.Tensor:
++    """ phi(gamma) / Phi(gamma), stable for very negative gamma. """
++    negative = math.sqrt(2 / math.pi) / torch.special.erfcx(
++        -gamma.clamp_max(0) / math.sqrt(2)
++    )
++    positive = torch.exp(-0.5 * gamma.square()) / (
++        math.sqrt(2 * math.pi) * 0.5 * torch.erfc(-gamma / math.sqrt(2))
++    ).clamp_min(1e-300)
++    return torch.where(gamma < 0, negative, positive)
++
++
++def in_region(z: List[int], centre: List[int], radius: int) -> bool:
++    """ Check whether ``z`` is within Hamming distance ``radius`` of ``centre``. """
++    return sum(int(a) != int(b) for a, b in zip(z, centre)) <= radius
++
++
++def single_flips(cat: List[int], n_cats: List[int], observed: set, centre: List[int],
++                 radius: int) -> List[List[int]]:
++    """ Unobserved points in the trust region that differ from ``cat`` in one variable. """
++    flips = []
++    for j in range(len(cat)):
++        for c in range(n_cats[j]):
++            if c != cat[j]:
++                z = list(cat)
++                z[j] = c
++                if tuple(z) not in observed and in_region(z, centre, radius):
++                    flips.append(z)
++    return flips
++
++
++def random_draws(cat: List[int], n_cats: List[int], radius: int, observed: set,
++                 rng: np.random.Generator, centre: List[int], min_changes: int = 2) -> List[List[int]]:
++    """ Up to ``N_FALLBACK`` random unobserved points in the trust region, each changing
++    ``min_changes`` to ``radius`` variables of ``cat``. """
++    n_nom = len(cat)
++    pool, tries = [], 0
++    r_max = max(1, min(int(radius), n_nom))
++    while radius > 0 and len(pool) < N_FALLBACK and tries < 20 * N_FALLBACK:
++        tries += 1
++        z = list(cat)
++        k = int(rng.integers(min_changes, r_max + 1)) if r_max >= min_changes else 1
++        for j in np.atleast_1d(rng.choice(n_nom, size=k, replace=False)):
++            z[int(j)] = int(rng.integers(0, n_cats[int(j)]))
++        if tuple(z) not in observed and in_region(z, centre, radius):
++            pool.append(z)
++    return pool
++
++
++class _FastBOAcqOptimizerBase(AcqOptimizerBase):
++    """ Common setup. Only nominal inputs, no input constraints. """
++
++    def __init__(self,
++                 search_space: SearchSpace,
++                 input_constraints: Optional[List[Callable[[Dict], bool]]],
++                 obj_dims: Union[List[int], np.ndarray, None],
++                 out_constr_dims: Union[List[int], np.ndarray, None],
++                 out_upper_constr_vals: Optional[torch.Tensor],
++                 dtype: torch.dtype = torch.float64,
++                 ):
++        assert search_space.num_nominal == search_space.num_params, \
++            "Fast BO only supports purely nominal (categorical) search spaces."
++        assert not input_constraints, "Fast BO does not support input constraints."
++        super().__init__(
++            search_space=search_space,
++            dtype=dtype,
++            input_constraints=input_constraints,
++            obj_dims=obj_dims,
++            out_constr_dims=out_constr_dims,
++            out_upper_constr_vals=out_upper_constr_vals,
++        )
++
++    @staticmethod
++    def observed_set(x_observed: torch.Tensor, nominal_dims: List[int]) -> set:
++        return {tuple(r) for r in x_observed[:, nominal_dims].round().long().cpu().tolist()}
++
++
++class FastBOMMAcqOptimizer(_FastBOAcqOptimizerBase):
++    r"""
++    LCB and EI, minimized by majorize-minimize (MM) from random starts.
++
++    Each MM step replaces the std by its tangent, which gives the linear objective
++    ``m - lam * (S_N phi_0) / s_0`` (``lam = beta`` for LCB, the inverse Mills ratio for
++    EI), and minimizes it exactly. We return the best result under the exact acquisition
++    that has not been observed yet. If all of them have been, we fall back to single flips
++    of the best one, then random points near it, then random points in the trust region.
++    """
++
++    color_1: str = get_color(ind=6, color_palette=COLORS_SNS_10)
++
++    @staticmethod
++    def get_color_1() -> str:
++        return FastBOMMAcqOptimizer.color_1
++
++    @property
++    def name(self) -> str:
++        return "Fast BO (MM)"
++
++    def __init__(self,
++                 search_space: SearchSpace,
++                 input_constraints: Optional[List[Callable[[Dict], bool]]],
++                 obj_dims: Union[List[int], np.ndarray, None],
++                 out_constr_dims: Union[List[int], np.ndarray, None],
++                 out_upper_constr_vals: Optional[torch.Tensor],
++                 n_restarts: int = 10,
++                 mm_steps: int = 10,
++                 dtype: torch.dtype = torch.float64,
++                 ):
++        super().__init__(search_space, input_constraints, obj_dims, out_constr_dims,
++                         out_upper_constr_vals, dtype)
++        self.n_restarts = n_restarts
++        self.mm_steps = mm_steps
++        self.std_guard = 1e-8
++
++    def mm(self, starts: np.ndarray, centre: np.ndarray, offsets: List[int], radius: int,
++           model: OneHotBLRModel, best_y: Optional[torch.Tensor], beta: Optional[float]) -> List[np.ndarray]:
++        """ Run MM on all starts at once. """
++        cats = np.asarray(starts).copy()
++        mean_w, vectors, denom = model.m_n, model.eig_vecs, model.denom
++        if beta is None:
++            best = float((best_y - model.y_mean) / model.y_std)
++        # Same variance floor as EI.evaluate (in original units)
++        floor = 1e-9 / float(model.y_std.square())
++        noise = float(1 / model.beta)
++        phi = features(cats, offsets, len(mean_w), mean_w.dtype, mean_w.device)
++        for _ in range(self.mm_steps):
++            sp = (phi @ vectors / denom) @ vectors.T  # S_N phi
++            variance = (phi * sp).sum(1).clamp_min(0) + noise
++            std = variance.clamp_min(floor).sqrt()
++            lam = (inverse_mills((best - phi @ mean_w) / std) if beta is None
++                   else torch.full_like(std, beta))
++            coef = torch.where((variance >= floor) & (std > self.std_guard), lam / std, 0)
++            weights = mean_w - coef[:, None] * sp
++            new = linear_minima(weights, centre, offsets, radius)
++            new_phi = features(new, offsets, len(mean_w), mean_w.dtype, mean_w.device)
++            accept = (weights * (new_phi - phi)).sum(1) <= 0
++            new = np.where(accept.cpu().numpy()[:, None], new, cats)
++            new_phi = torch.where(accept[:, None], new_phi, phi)
++            done = np.array_equal(new, cats)
++            cats, phi = new, new_phi
++            if done:
++                break
++        return list(cats)
++
++    def optimize(self,
++                 x: torch.Tensor,
++                 n_suggestions: int,
++                 x_observed: torch.Tensor,
++                 model: ModelBase,
++                 acq_func: AcqBase,
++                 acq_evaluate_kwargs: dict,
++                 tr_manager: Optional[TrManagerBase],
++                 **kwargs
++                 ) -> torch.Tensor:
++        assert n_suggestions == 1, "FastBOMMAcqOptimizer supports n_suggestions == 1."
++        assert isinstance(model, OneHotBLRModel), \
++            f"FastBOMMAcqOptimizer requires a OneHotBLRModel, got {type(model)}."
++        is_lcb = isinstance(acq_func, LCB)
++        assert is_lcb or (isinstance(acq_func, EI) and not acq_func.augmented_ei), \
++            "FastBOMMAcqOptimizer requires LCB or ordinary Gaussian EI."
++
++        device, dtype = model.device, model.dtype
++        nominal_dims = model.nominal_dims
++        offsets = model.block_offsets
++        n_nom = len(nominal_dims)
++        n_cats = np.array(model.n_cats_per_dim)
++
++        # Trust-region centre and Hamming radius
++        centre = x.clone().view(-1).to(device=device, dtype=dtype)
++        centre_cat = np.array([int(centre[d].round().item()) for d in nominal_dims])
++        radius = int(tr_manager.get_nominal_radius()) if tr_manager is not None else n_nom
++        radius = max(0, min(radius, n_nom))
++
++        # Random starts: set `radius` random variables of the centre to random categories.
++        # Seeded from the global numpy RNG.
++        rng = np.random.default_rng(np.random.randint(0, 2 ** 32))
++        starts = []
++        for _ in range(self.n_restarts):
++            cat0 = centre_cat.copy()
++            if radius > 0:
++                idx = rng.choice(n_nom, size=radius, replace=False)
++                cat0[idx] = rng.integers(0, n_cats[idx])
++            starts.append(cat0)
++        candidates = self.mm(starts, centre_cat, offsets, radius, model,
++                             best_y=None if is_lcb else acq_evaluate_kwargs["best_y"],
++                             beta=float(acq_func.beta) if is_lcb else None)
++
++        # Score the distinct candidates with the exact acquisition
++        cats = list({tuple(c): c for c in candidates}.values())
++        x_cand = centre.view(1, -1).repeat(len(cats), 1)
++        for i, c in enumerate(cats):
++            for j, d in enumerate(nominal_dims):
++                x_cand[i, d] = float(c[j])
++        acq_vals = acq_func(x=x_cand, model=model, **acq_evaluate_kwargs).flatten()
++
++        # Return the best candidate we haven't evaluated yet (the tasks are deterministic)
++        observed = self.observed_set(x_observed.to(device=device, dtype=dtype), nominal_dims)
++        for i in torch.argsort(acq_vals).tolist():
++            if tuple(x_cand[i][nominal_dims].round().long().cpu().tolist()) not in observed:
++                return x_cand[i].view(1, -1).to(self.dtype)
++
++        # All candidates already observed: fall back to single flips of the best one, then
++        # random points near it, then random points anywhere in the trust region
++        best_i = min(range(len(cats)), key=lambda i: float(acq_vals[i]))
++        base = x_cand[best_i]
++        base_cat = [int(round(float(base[d]))) for d in nominal_dims]
++        centre_list = [int(c) for c in centre_cat]
++        for make_pool in (
++                lambda: single_flips(base_cat, list(n_cats), observed, centre_list, radius),
++                lambda: random_draws(base_cat, list(n_cats), radius, observed, rng, centre_list),
++                lambda: random_draws(centre_list, list(n_cats), radius, observed, rng, centre_list,
++                                     min_changes=1)):
++            pool = make_pool()
++            if pool:
++                x_pool = base.view(1, -1).repeat(len(pool), 1)
++                for i, c in enumerate(pool):
++                    for j, d in enumerate(nominal_dims):
++                        x_pool[i, d] = float(c[j])
++                values = acq_func(x=x_pool, model=model, **acq_evaluate_kwargs).flatten()
++                return x_pool[int(torch.argmin(values).item())].view(1, -1).to(self.dtype)
++        return base.view(1, -1).to(self.dtype)
++
++
++class FastBOTSAcqOptimizer(_FastBOAcqOptimizerBase):
++    r"""
++    Thompson sampling, minimized exactly.
++
++    Draws one posterior weight sample and minimizes it over the trust region. If the
++    result was already observed, uses the same fallback as FastBOMMAcqOptimizer.
++    """
++
++    color_1: str = get_color(ind=5, color_palette=COLORS_SNS_10)
++
++    @staticmethod
++    def get_color_1() -> str:
++        return FastBOTSAcqOptimizer.color_1
++
++    @property
++    def name(self) -> str:
++        return "Fast BO (TS)"
++
++    def optimize(self,
++                 x: torch.Tensor,
++                 n_suggestions: int,
++                 x_observed: torch.Tensor,
++                 model: ModelBase,
++                 acq_func: AcqBase,
++                 acq_evaluate_kwargs: dict,
++                 tr_manager: Optional[TrManagerBase],
++                 **kwargs
++                 ) -> torch.Tensor:
++        assert n_suggestions == 1, "FastBOTSAcqOptimizer supports n_suggestions == 1."
++        assert isinstance(model, OneHotBLRModel), \
++            f"FastBOTSAcqOptimizer requires a OneHotBLRModel, got {type(model)}."
++
++        nominal_dims = model.nominal_dims
++        offsets = model.block_offsets
++        n_cats = list(model.n_cats_per_dim)
++
++        # Trust-region centre and Hamming radius
++        centre = x.clone().view(-1).to(device=model.device, dtype=model.dtype)
++        centre_cat = np.array([int(centre[d].round().item()) for d in nominal_dims])
++        radius = int(tr_manager.get_nominal_radius()) if tr_manager is not None else len(nominal_dims)
++
++        w = model.sample_weights(n_samples=1)  # (1, D), standardized
++        observed = self.observed_set(x_observed.to(model.device), nominal_dims)
++        rng = np.random.default_rng(np.random.randint(0, 2 ** 32))
++
++        def sampled_value(cat: List[int]) -> float:
++            return float(sum(float(w[0, offsets[j] + int(c)]) for j, c in enumerate(cat)))
++
++        chosen = [int(c) for c in linear_minima(w, centre_cat, offsets, radius)[0]]
++        if tuple(chosen) in observed:
++            # Already observed: same fallback as in FastBOMMAcqOptimizer
++            centre_list = [int(c) for c in centre_cat]
++            for pool in (lambda: single_flips(chosen, n_cats, observed, centre_list, radius),
++                         lambda: random_draws(chosen, n_cats, radius, observed, rng, centre_list),
++                         lambda: random_draws(centre_list, n_cats, radius, observed, rng,
++                                              centre_list, min_changes=1)):
++                candidates = pool()
++                if candidates:
++                    chosen = min(candidates, key=sampled_value)
++                    break
++
++        x_next = centre.clone()
++        for j, d in enumerate(nominal_dims):
++            x_next[d] = chosen[j]
++        return x_next.view(1, -1).to(self.dtype)
+diff --git a/MCBO/mcbo/models/__init__.py b/MCBO/mcbo/models/__init__.py
+index d0d7241..1158577 100644
+--- a/MCBO/mcbo/models/__init__.py
++++ b/MCBO/mcbo/models/__init__.py
+@@ -8,5 +8,5 @@
+ # PARTICULAR PURPOSE. See the MIT License for more details.
+ 
+ from mcbo.models.model_base import ModelBase, EnsembleModelBase
+-from mcbo.models.linear_reagression import LinRegModel
++from mcbo.models.linear_reagression import LinRegModel, OneHotBLRModel
+ from mcbo.models.gp import ExactGPModel, ComboGPModel, ComboEnsembleGPModel, RandDecompositionGP, RandEnsembleGPModel
+diff --git a/MCBO/mcbo/models/linear_reagression/__init__.py b/MCBO/mcbo/models/linear_reagression/__init__.py
+index ac1ec55..82655bf 100644
+--- a/MCBO/mcbo/models/linear_reagression/__init__.py
++++ b/MCBO/mcbo/models/linear_reagression/__init__.py
+@@ -7,4 +7,5 @@
+ # WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+ # PARTICULAR PURPOSE. See the MIT License for more details.
+ 
+-from mcbo.models.linear_reagression.linear_regression import LinRegModel
+\ No newline at end of file
++from mcbo.models.linear_reagression.linear_regression import LinRegModel
++from mcbo.models.linear_reagression.onehot_blr import OneHotBLRModel
+\ No newline at end of file
+diff --git a/MCBO/mcbo/models/linear_reagression/onehot_blr.py b/MCBO/mcbo/models/linear_reagression/onehot_blr.py
+new file mode 100644
+index 0000000..888dcc8
+--- /dev/null
++++ b/MCBO/mcbo/models/linear_reagression/onehot_blr.py
+@@ -0,0 +1,184 @@
++# This program is free software; you can redistribute it and/or modify it under
++# the terms of the MIT license.
++
++# This program is distributed in the hope that it will be useful, but WITHOUT ANY
++# WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
++# PARTICULAR PURPOSE. See the MIT License for more details.
++
++from typing import List, Optional
++
++import torch
++
++from mcbo.models.model_base import ModelBase
++from mcbo.search_space import SearchSpace
++
++
++class OneHotBLRModel(ModelBase):
++    r"""
++    Bayesian linear regression on one-hot features, fit in closed form.
++
++    Equivalent to a GP with the overlap kernel (without ARD):
++
++        prior:       w ~ N(0, alpha^{-1} I)
++        likelihood:  t ~ N(Phi w, beta^{-1} I)
++
++    alpha and beta are fit with Bishop's evidence maximization (PRML 3.5), reusing one
++    eigendecomposition of ``Phi^T Phi``. D is the number of one-hot features.
++
++    We use Bishop's notation. In the paper, alpha is tau, 1/beta is sigma^2, Phi is H and
++    D is M (the paper's D is the number of variables).
++    """
++
++    supports_cuda = True
++    support_grad = False
++    support_ts = True
++    support_multi_output = False
++    support_warm_start = True
++
++    @property
++    def name(self) -> str:
++        return "BLR (OL)"
++
++    def __init__(
++            self,
++            search_space: SearchSpace,
++            num_out: int = 1,
++            noise_lb: float = 1e-8,
++            max_iter: int = 100,
++            tol: float = 1e-5,
++            dtype: torch.dtype = torch.float64,
++            device: torch.device = torch.device("cpu"),
++    ):
++        super(OneHotBLRModel, self).__init__(search_space=search_space, num_out=num_out, dtype=dtype, device=device)
++        assert self.num_out == 1, "OneHotBLRModel only supports single-output regression."
++        assert len(self.nominal_dims) > 0, "OneHotBLRModel expects nominal (categorical) dimensions."
++
++        self.noise_lb = noise_lb
++        self.max_iter = max_iter
++        self.tol = tol
++
++        # Number of categories per variable
++        self.n_cats_per_dim = [
++            len(self.search_space.params[name].categories) for name in self.search_space.nominal_names
++        ]
++        # Start of each variable's one-hot block in Phi
++        self.block_offsets = [0]
++        for n_cat in self.n_cats_per_dim:
++            self.block_offsets.append(self.block_offsets[-1] + n_cat)
++
++        # Set in fit()
++        self.alpha: Optional[torch.Tensor] = None  # prior precision
++        self.beta: Optional[torch.Tensor] = None  # noise precision (1 / noise_var)
++        self.m_n: Optional[torch.Tensor] = None  # posterior mean weights, shape (D,)
++        self.eig_vecs: Optional[torch.Tensor] = None  # eigenvectors of Phi^T Phi, shape (D, D)
++        self.denom: Optional[torch.Tensor] = None  # alpha + beta * eigenvalues, shape (D,)
++
++    def y_to_fit_y(self, y: torch.Tensor) -> torch.Tensor:
++        return (y - self.y_mean.to(y)) / self.y_std.to(y)
++
++    def fit_y_to_y(self, fit_y: torch.Tensor) -> torch.Tensor:
++        return fit_y * self.y_std.to(fit_y) + self.y_mean.to(fit_y)
++
++    def _featurize(self, x: torch.Tensor) -> torch.Tensor:
++        """ One-hot encode the nominal dimensions of `x` -> Phi of shape (N, D). """
++        x = x.to(dtype=self.dtype, device=self.device)
++        blocks = []
++        for j, dim in enumerate(self.nominal_dims):
++            n_cat = self.n_cats_per_dim[j]
++            idx = x[:, dim].round().long().clamp_(0, n_cat - 1)
++            oh = torch.zeros(x.shape[0], n_cat, dtype=self.dtype, device=self.device)
++            oh.scatter_(1, idx.unsqueeze(1), 1.0)
++            blocks.append(oh)
++        return torch.cat(blocks, dim=1)
++
++    def fit(self, x: torch.Tensor, y: torch.Tensor, **kwargs) -> List[float]:
++        assert x.ndim == 2
++        assert y.ndim == 2, y.shape
++        assert x.shape[0] == y.shape[0]
++        assert y.shape[1] == self.num_out, (y.shape, self.num_out)
++
++        self.x = x.to(dtype=self.dtype, device=self.device)
++        self._y = y.to(dtype=self.dtype, device=self.device)
++        self.fit_y = self.y_to_fit_y(y=self._y)
++
++        phi = self._featurize(self.x)  # (N, D)
++        t = self.fit_y.squeeze(-1)  # (N,)
++        n = phi.shape[0]
++
++        # Eigendecomposition of Phi^T Phi (D x D), reused for every evidence update
++        a_mat = phi.transpose(-1, -2) @ phi  # (D, D)
++        eigvals, eigvecs = torch.linalg.eigh(a_mat)  # ascending eigvals (D,), eigvecs (D, D)
++        eigvals = eigvals.clamp_(min=0.0)
++        b = phi.transpose(-1, -2) @ t  # (D,)
++        c = eigvecs.transpose(-1, -2) @ b  # projection of b into eigenbasis, (D,)
++        tt = torch.dot(t, t)  # ||t||^2
++
++        beta_max = torch.tensor(1.0 / self.noise_lb, dtype=self.dtype, device=self.device)
++
++        # Evidence maximization for (alpha, beta), same iteration as sklearn's BayesianRidge
++        alpha = torch.tensor(1.0, dtype=self.dtype, device=self.device)
++        beta = torch.tensor(1.0, dtype=self.dtype, device=self.device)
++        for _ in range(self.max_iter):
++            denom = alpha + beta * eigvals  # (D,)
++            p = beta * c / denom  # eigenbasis coeffs of posterior mean (m_N = V p)
++            m_sq = torch.dot(p, p)  # m_N^T m_N
++            gamma = (beta * eigvals / denom).sum()  # effective number of parameters
++            rss = (tt - 2.0 * torch.dot(p, c) + torch.dot(eigvals * p, p)).clamp_(min=1e-12)
++
++            new_alpha = (gamma / m_sq.clamp_(min=1e-12))
++            new_beta = ((n - gamma).clamp_(min=1e-6) / rss).clamp_(max=beta_max)
++
++            if (torch.abs(new_alpha - alpha) <= self.tol * alpha
++                    and torch.abs(new_beta - beta) <= self.tol * beta):
++                alpha, beta = new_alpha, new_beta
++                break
++            alpha, beta = new_alpha, new_beta
++
++        denom = alpha + beta * eigvals
++        p = beta * c / denom
++        self.alpha = alpha
++        self.beta = beta
++        self.eig_vecs = eigvecs
++        self.denom = denom
++        self.m_n = eigvecs @ p  # posterior mean weights, (D,)
++
++        return []
++
++    def predict(self, x: torch.Tensor, **kwargs) -> (torch.Tensor, torch.Tensor):
++        """ Predictive mean and variance of y (the variance includes the noise). """
++        phi = self._featurize(x)  # (M, D)
++        mu = phi @ self.m_n  # (M,) standardized mean
++        z = phi @ self.eig_vecs  # (M, D)
++        var = (z * z / self.denom).sum(dim=1)  # phi^T S_N phi, (M,)
++        var = var + 1.0 / self.beta
++
++        mu = mu.reshape(-1, self.num_out)
++        var = var.reshape(-1, self.num_out)
++
++        mu = self.fit_y_to_y(fit_y=mu)
++        var = var * self.y_std.to(var) ** 2
++        return mu, var.clamp(min=torch.finfo(var.dtype).eps)
++
++    def sample_weights(self, n_samples: int = 1) -> torch.Tensor:
++        r"""
++        Sample weights from the posterior N(m_N, S_N) (standardized targets). Returns shape
++        (n_samples, D). With S_N = V diag(1/denom) V^T, w = m_N + V (z / sqrt(denom)).
++        """
++        assert self.m_n is not None, "Model must be fit before sampling weights."
++        d = self.m_n.shape[0]
++        z = torch.randn(n_samples, d, dtype=self.dtype, device=self.device)
++        u = z / self.denom.sqrt()  # (n_samples, D)
++        return self.m_n.unsqueeze(0) + u @ self.eig_vecs.transpose(-1, -2)
++
++    @property
++    def noise(self) -> torch.Tensor:
++        return ((1.0 / self.beta) * self.y_std ** 2).view(self.num_out).detach()
++
++    def to(self, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None) -> "OneHotBLRModel":
++        self.device = device
++        self.dtype = dtype
++        for attr in ("alpha", "beta", "m_n", "eig_vecs", "denom", "x", "_y", "fit_y"):
++            val = getattr(self, attr, None)
++            if isinstance(val, torch.Tensor):
++                setattr(self, attr, val.to(device=device, dtype=dtype))
++        return self
+diff --git a/MCBO/mcbo/optimizers/bo_base.py b/MCBO/mcbo/optimizers/bo_base.py
+index d116be8..fb22e63 100644
+--- a/MCBO/mcbo/optimizers/bo_base.py
++++ b/MCBO/mcbo/optimizers/bo_base.py
+@@ -342,6 +342,89 @@ class BoBase(OptimizerBase):
+ 
+         return x_next
+ 
++    def method_suggest_transformed(self, n_suggestions: int = 1) -> torch.Tensor:
++        """Like method_suggest, but returns transformed tensors without a DataFrame.
++
++        Falls back to method_suggest during the initial design and trust region resets.
++        """
++        if len(self.x_init) > 0 or not self.can_fit_all_models():
++            return self.search_space.transform(self.method_suggest(n_suggestions))
++
++        if self.tr_manager is not None:
++            for variable_type in self.tr_manager.variable_types:
++                if self.tr_manager.radii[variable_type] < self.tr_manager.min_radii[variable_type]:
++                    # Trust region reset, let method_suggest handle it
++                    return self.search_space.transform(self.method_suggest(n_suggestions))
++
++        data_buffer = self.tr_manager.data_buffer if self.tr_manager is not None else self.data_buffer
++        move_model_to_device(model=self.model, data_buffer=data_buffer, target_device=self.device)
++
++        filter_nan = torch.isnan(data_buffer.y[:, self.obj_dims]).sum(-1) == 0
++        obj_x = data_buffer.x[filter_nan]
++        obj_y = data_buffer.y[filter_nan][:, self.obj_dims]
++
++        constr_xs, constr_ys = [], []
++        for out_constr_dim in self.out_constr_dims:
++            f = torch.isnan(data_buffer.y[:, [out_constr_dim]]).sum(-1) == 0
++            constr_xs.append(data_buffer.x[f])
++            constr_ys.append(data_buffer.y[f][:, [out_constr_dim]])
++
++        self.model.pre_fit_method(x=obj_x, y=obj_y)
++        if self.constr_models is not None:
++            for i in range(len(self.out_constr_dims)):
++                move_model_to_device(self.constr_models[i], data_buffer, self.device)
++                self.constr_models[i].pre_fit_method(x=constr_xs[i], y=constr_ys[i])
++
++        time_ref = time.time()
++        _ = self.model.fit(x=obj_x, y=obj_y)
++        if self.constr_models is not None:
++            for i, constr_model in enumerate(self.constr_models):
++                _ = constr_model.fit(x=constr_xs[i], y=constr_ys[i])
++        self.fit_time.append(time.time() - time_ref)
++
++        best_x, best_y = self.get_best_x_and_y()
++        assert best_y.shape == (self.num_outputs,)
++        valid_filtr = self.get_valid_filter(best_y.unsqueeze(0)).item()
++        best_obj = best_y[self.obj_dims] if valid_filtr else None
++
++        time_ref = time.time()
++        x_remaining = self.acq_optimizer.optimize(
++            x=best_x,
++            n_suggestions=n_suggestions,
++            x_observed=self.data_buffer.x,
++            model=self.model,
++            constr_models=self.constr_models,
++            out_upper_constr_vals=self.out_upper_constr_vals,
++            acq_func=self.acq_func,
++            acq_evaluate_kwargs={'best_y': best_obj},
++            tr_manager=self.tr_manager
++        )
++        self.acq_time.append(time.time() - time_ref)
++        return x_remaining
++
++    def method_observe_transformed(self, x: torch.Tensor, y: np.ndarray) -> None:
++        """:meth:`method_observe` on an already-transformed ``x``."""
++        time_ref = time.time()
++        x_transf = x
++        if isinstance(y, np.ndarray):
++            y = torch.tensor(y, dtype=self.dtype)
++        assert len(x_transf) == len(y)
++
++        self.data_buffer.append(x_transf, y)
++
++        if self.tr_manager is not None:
++            if len(self.tr_manager.data_buffer) > self.n_init:
++                self.tr_manager.adjust_tr_radii(y)
++            self.tr_manager.append(x_transf, y)
++            self.tr_manager.adjust_tr_center()
++
++        self.update_best(x_transf=x_transf, y=y)
++
++        # Same as in method_observe (only does something for CoCaBO)
++        self.acq_optimizer.post_observe_method(x=x_transf, y=y, data_buffer=self.data_buffer, n_init=self.n_init)
++
++        self.observe_time.append(time.time() - time_ref)
++
+     def method_observe(self, x: pd.DataFrame, y: np.ndarray) -> None:
+         time_ref = time.time()
+ 
+diff --git a/MCBO/mcbo/optimizers/bo_builder.py b/MCBO/mcbo/optimizers/bo_builder.py
+index 6866b9a..b568cb3 100644
+--- a/MCBO/mcbo/optimizers/bo_builder.py
++++ b/MCBO/mcbo/optimizers/bo_builder.py
+@@ -11,11 +11,12 @@ from mcbo.acq_optimizers import AcqOptimizerBase
+ from mcbo.acq_optimizers.genetic_algorithm_acq_optimizer import GeneticAlgoAcqOptimizer
+ from mcbo.acq_optimizers.interleaved_search_acq_optimizer import InterleavedSearchAcqOptimizer
+ from mcbo.acq_optimizers.local_search_acq_optimizer import LsAcqOptimizer
++from mcbo.acq_optimizers.fast_bo_acq_optimizers import FastBOMMAcqOptimizer, FastBOTSAcqOptimizer
+ from mcbo.acq_optimizers.message_passing_optimizer import MessagePassingOptimizer
+ from mcbo.acq_optimizers.mixed_mab_acq_optimizer import MixedMabAcqOptimizer
+ from mcbo.acq_optimizers.random_search_acq_optimizer import RandomSearchAcqOptimizer
+ from mcbo.acq_optimizers.simulated_annealing_acq_optimizer import SimulatedAnnealingAcqOptimizer
+-from mcbo.models import ModelBase, ExactGPModel, ComboEnsembleGPModel, LinRegModel, RandDecompositionGP
++from mcbo.models import ModelBase, ExactGPModel, ComboEnsembleGPModel, LinRegModel, OneHotBLRModel, RandDecompositionGP
+ from mcbo.models.gp.kernel_factory import mixture_kernel_factory, kernel_factory
+ from mcbo.optimizers import BoBase
+ from mcbo.search_space import SearchSpace
+@@ -237,6 +238,14 @@ class BoBuilder:
+                 device=model_kwargs["device"],
+                 **lin_reg_kwargs
+             )
++        elif model_id == "lr_ol":
++            # Fast BO: Bayesian linear regression on one-hot features
++            model = OneHotBLRModel(
++                search_space=search_space,
++                num_out=1,
++                dtype=model_kwargs["dtype"],
++                device=model_kwargs["device"],
++            )
+         elif model_id in ["gp_rd", "gp_rdto", "gp_rdhed"]:
+             gp_kwargs = DEFAULT_MODEL_EXACT_GP_KWARGS.copy()
+             gp_kwargs["max_batch_size"] = 200
+@@ -351,6 +360,26 @@ class BoBuilder:
+                 out_upper_constr_vals=out_upper_constr_vals,
+                 **kwargs
+             )
++        elif acq_optim_name == "fast_mm":
++            # Fast BO with LCB or EI
++            acq_optim = FastBOMMAcqOptimizer(
++                search_space=search_space,
++                input_constraints=input_constraints,
++                obj_dims=obj_dims,
++                out_constr_dims=out_constr_dims,
++                out_upper_constr_vals=out_upper_constr_vals,
++                **acq_optim_kwargs
++            )
++        elif acq_optim_name == "fast_ts":
++            # Fast BO with Thompson sampling
++            acq_optim = FastBOTSAcqOptimizer(
++                search_space=search_space,
++                input_constraints=input_constraints,
++                obj_dims=obj_dims,
++                out_constr_dims=out_constr_dims,
++                out_upper_constr_vals=out_upper_constr_vals,
++                **acq_optim_kwargs
++            )
+         elif acq_optim_name == "rs":
+             kwargs = DEFAULT_ACQ_OPTIM_RS_KWARGS
+             kwargs.update(acq_optim_kwargs)
+@@ -522,7 +551,10 @@ class BoBuilder:
+             copy.deepcopy(model) for _ in range(len(out_constr_dims))
+         ]
+ 
+-        acq_func = acq_factory(self.acq_func_id, **self.acq_func_kwargs)
++        acq_func_kwargs = dict(self.acq_func_kwargs)
++        if self.acq_opt_id == "fast_mm" and self.acq_func_id == "lcb":
++            acq_func_kwargs.setdefault("beta", 2.0)  # same as the continuous version
++        acq_func = acq_factory(self.acq_func_id, **acq_func_kwargs)
+         acq_optim = self.get_acq_optim(
+             search_space=search_space,
+             acq_optim_name=self.acq_opt_id,
+diff --git a/MCBO/mcbo/search_space/search_space.py b/MCBO/mcbo/search_space/search_space.py
+index f1df98c..edf5d90 100644
+--- a/MCBO/mcbo/search_space/search_space.py
++++ b/MCBO/mcbo/search_space/search_space.py
+@@ -161,6 +161,16 @@ class SearchSpace:
+                     df[name] = self.params[name].sample(num_samples)
+         return df
+ 
++    def consume_sample_rng(self, num_samples: int = 1) -> None:
++        """Advance the RNG exactly like :meth:`sample`, without building the DataFrame.
++
++        This keeps the tensor path bit-identical to the DataFrame path.
++        """
++        if num_samples <= 0:
++            return
++        for name in self.param_names:
++            self.params[name].sample(num_samples)
++
+     def transform(self, data: pd.DataFrame) -> torch.Tensor:
+         """
+         input: pandas dataframe
+diff --git a/MCBO/mcbo/task_factory.py b/MCBO/mcbo/task_factory.py
+index 675f28b..83ca5b4 100644
+--- a/MCBO/mcbo/task_factory.py
++++ b/MCBO/mcbo/task_factory.py
+@@ -8,7 +8,8 @@
+ # PARTICULAR PURPOSE. See the MIT License for more details.
+ 
+ from mcbo.tasks import TaskBase, PestControl, CDRH3Design, \
+-    MigSeqOpt
++    MigSeqOpt, Contamination, Labs
++from mcbo.tasks.synthetic.maxsat.maxsat import MaxSat60, MaxSat125
+ from mcbo.tasks.synthetic.sfu.sfu_task import SfuTask
+ from mcbo.tasks.synthetic.sfu.utils_sfu import SFU_FUNCTIONS
+ 
+@@ -38,6 +39,18 @@ def task_factory(task_name: str, **kwargs) -> TaskBase:
+     elif task_name == 'pest':
+         task = PestControl()
+ 
++    elif task_name == 'contamination':
++        task = Contamination()
++
++    elif task_name == 'maxsat60':
++        task = MaxSat60()
++
++    elif task_name == 'maxsat125':
++        task = MaxSat125()
++
++    elif task_name == 'labs':
++        task = Labs()
++
+     elif task_name == 'antibody_design':
+         task = CDRH3Design(
+             antigen=kwargs.get('antigen', '2DD8_S'),
+diff --git a/MCBO/mcbo/tasks/__init__.py b/MCBO/mcbo/tasks/__init__.py
+index 3944d38..6d0c048 100644
+--- a/MCBO/mcbo/tasks/__init__.py
++++ b/MCBO/mcbo/tasks/__init__.py
+@@ -9,6 +9,6 @@
+ 
+ from mcbo.tasks.task_base import TaskBase
+ from mcbo.tasks.synthetic.sfu.sfu_base import SfuFunction
+-from mcbo.tasks.synthetic import PestControl
++from mcbo.tasks.synthetic import PestControl, Contamination, Labs
+ from mcbo.tasks.antibody_design import CDRH3Design
+ from mcbo.tasks.mig_seq_opt import MigSeqOpt
+\ No newline at end of file
+diff --git a/MCBO/mcbo/tasks/synthetic/__init__.py b/MCBO/mcbo/tasks/synthetic/__init__.py
+index 32c7a4e..f713921 100644
+--- a/MCBO/mcbo/tasks/synthetic/__init__.py
++++ b/MCBO/mcbo/tasks/synthetic/__init__.py
+@@ -9,3 +9,5 @@
+ 
+ from mcbo.tasks.synthetic.sfu import *
+ from mcbo.tasks.synthetic.pest import PestControl
++from mcbo.tasks.synthetic.contamination import Contamination
++from mcbo.tasks.synthetic.labs import Labs
+diff --git a/MCBO/mcbo/tasks/synthetic/contamination.py b/MCBO/mcbo/tasks/synthetic/contamination.py
+new file mode 100644
+index 0000000..27f0326
+--- /dev/null
++++ b/MCBO/mcbo/tasks/synthetic/contamination.py
+@@ -0,0 +1,151 @@
++# Adapted from Bounce (https://github.com/lpapenme/bounce), MIT License.
++
++import torch
++import pandas as pd
++import numpy as np
++from typing import List, Dict, Any
++
++from mcbo.tasks import TaskBase
++
++
++class Contamination(TaskBase):
++    """
++    Contamination Control Problem with the simplest graph
++    """
++
++    categories = ["OFF", "ON"]
++
++    @property
++    def name(self) -> str:
++        return "Contamination"
++
++    def __init__(self, effective_dim: int = 25, ambient_dim: int = 25, *args, **kwargs):
++        """
++        Initialize the benchmark function.
++
++        Args:
++            effective_dim: the effective dimensionality of the function
++            ambient_dim: the ambient dimensionality of the function
++            *args: additional arguments
++            **kwargs: additional keyword arguments
++        """
++        super().__init__()
++
++        self.ambient_dim = ambient_dim
++        self.effective_dim = effective_dim
++        self.lamda = 1e-2
++        # In all evaluations, the same sampled values are used.
++        self.init_Z, self.lambdas, self.gammas = generate_contamination_dynamics(
++            random_seed=42
++        )
++
++    def evaluate(self, x: pd.DataFrame) -> np.ndarray:
++        x = x.replace(["OFF", "ON"], [0, 1])
++        return self.evaluate_transformed(x.to_numpy())
++
++    def evaluate_transformed(self, x_idx: np.ndarray) -> np.ndarray:
++        """Evaluate a matrix of category indices."""
++        # int64 like in evaluate(), floats change the results in the last bits
++        x = torch.from_numpy(np.asarray(x_idx).astype(np.int64).squeeze())
++        if x.dim() == 1:
++            x = x.unsqueeze(0)
++        assert x.size(1) == self.ambient_dim
++        fxs = (
++            torch.cat([self._evaluate_single(x[i]) for i in range(x.size(0))], dim=0)
++            .to(dtype=torch.double)
++            .detach()
++            .cpu()
++            .numpy()
++        )
++        return fxs[:, None]
++
++    def _evaluate_single(self, x):
++        assert x.dim() == 1
++        assert x.numel() == self.ambient_dim
++        if x.dim() == 2:
++            x = x.squeeze(0)
++        x = x[: self.effective_dim]
++        evaluation = _contamination(
++            x=(x.cpu() if x.is_cuda else x).numpy(),
++            cost=np.ones(x.numel()),
++            init_Z=self.init_Z,
++            lambdas=self.lambdas,
++            gammas=self.gammas,
++            U=0.1,
++            epsilon=0.05,
++        )
++        evaluation += self.lamda * float(torch.sum(x))
++        return evaluation * x.new_ones((1,)).float()
++
++    @staticmethod
++    def get_static_search_space_params(n_stages: int) -> List[Dict[str, Any]]:
++        params = []
++        for i in range(1, n_stages + 1):
++            params.append(
++                {
++                    "name": f"stage_{i}",
++                    "type": "nominal",
++                    "categories": Contamination.categories,
++                }
++            )
++        return params
++
++    def get_search_space_params(self) -> List[Dict[str, Any]]:
++        return self.get_static_search_space_params(n_stages=self.ambient_dim)
++
++
++def generate_contamination_dynamics(
++    random_seed: int = None,
++) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
++    """
++    Generate the contamination dynamics for the Contamination benchmark.
++
++    Args:
++        random_seed: the random seed to use for the random number generator
++
++    Returns:
++        the initial contamination, the contamination lambdas, and the restoration gammas
++
++    """
++    n_stages = 25
++    n_simulations = 100
++
++    init_alpha = 1.0
++    init_beta = 30.0
++    contam_alpha = 1.0
++    contam_beta = 17.0 / 3.0
++    restore_alpha = 1.0
++    restore_beta = 3.0 / 7.0
++    init_Z = np.random.RandomState(random_seed).beta(
++        init_alpha, init_beta, size=(n_simulations,)
++    )
++    lambdas = np.random.RandomState(random_seed).beta(
++        contam_alpha, contam_beta, size=(n_stages, n_simulations)
++    )
++    gammas = np.random.RandomState(random_seed).beta(
++        restore_alpha, restore_beta, size=(n_stages, n_simulations)
++    )
++
++    return init_Z, lambdas, gammas
++
++
++def _contamination(x: np.ndarray, cost, init_Z, lambdas, gammas, U, epsilon):
++    assert x.size == 25
++
++    rho = 1.0
++    n_simulations = 100
++
++    Z = np.zeros((x.size, n_simulations))
++    Z[0] = (
++        lambdas[0] * (1.0 - x[0]) * (1.0 - init_Z) + (1.0 - gammas[0] * x[0]) * init_Z
++    )
++    for i in range(1, 25):
++        Z[i] = (
++            lambdas[i] * (1.0 - x[i]) * (1.0 - Z[i - 1])
++            + (1.0 - gammas[i] * x[i]) * Z[i - 1]
++        )
++
++    below_threshold = Z < U
++    constraints = np.mean(below_threshold, axis=1) - (1.0 - epsilon)
++
++    return np.sum(x * cost - rho * constraints)
+diff --git a/MCBO/mcbo/tasks/synthetic/labs.py b/MCBO/mcbo/tasks/synthetic/labs.py
+new file mode 100644
+index 0000000..d67b59f
+--- /dev/null
++++ b/MCBO/mcbo/tasks/synthetic/labs.py
+@@ -0,0 +1,73 @@
++# Adapted from Bounce (https://github.com/lpapenme/bounce), MIT License.
++
++import torch
++import pandas as pd
++import numpy as np
++from typing import List, Dict, Any
++
++from mcbo.tasks import TaskBase
++
++
++class Labs(TaskBase):
++    """
++    The low-autocorrelation binary sequence (LABS) benchmark
++    """
++
++    categories = ["OFF", "ON"]
++
++    @property
++    def name(self) -> str:
++        return "LABS"
++
++    def __init__(self, dim: int = 50, *args, **kwargs):
++        """
++        Initialize the benchmark function.
++
++        Args:
++            dim: the dimensionality of the function
++            *args: additional arguments
++            **kwargs: additional keyword arguments
++        """
++        super().__init__()
++
++        self.dim = dim
++
++    def evaluate(self, x: pd.DataFrame) -> np.ndarray:
++        x = x.replace(["OFF", "ON"], [0, 1])
++        return self.evaluate_transformed(x.to_numpy())
++
++    def evaluate_transformed(self, x_idx: np.ndarray) -> np.ndarray:
++        """Evaluate a matrix of category indices."""
++        # int64 like in evaluate(), floats change the results in the last bits
++        x = torch.from_numpy(np.asarray(x_idx).astype(np.int64).squeeze())
++        x = x.clone().detach()
++        if x.ndim == 1:
++            x = x.unsqueeze(0)
++        assert x.ndim == 2
++        fxs = []
++        for _x in x:
++            # set the 0s to -1
++            _x[_x == 0] = -1
++            e = 0
++            for k in range(1, self.dim):
++                e += torch.square(torch.sum(_x[:-k] * _x[k:]))
++            fx = -(self.dim**2 / (2 * e)).to(dtype=torch.double).unsqueeze(-1)
++            fxs.append(fx)
++        fxs = torch.cat(fxs, dim=0).detach().cpu().numpy()
++        return fxs[:, None]
++
++    @staticmethod
++    def get_static_search_space_params(n_stages: int) -> List[Dict[str, Any]]:
++        params = []
++        for i in range(1, n_stages + 1):
++            params.append(
++                {
++                    "name": f"stage_{i}",
++                    "type": "nominal",
++                    "categories": Labs.categories,
++                }
++            )
++        return params
++
++    def get_search_space_params(self) -> List[Dict[str, Any]]:
++        return self.get_static_search_space_params(n_stages=self.dim)
+diff --git a/MCBO/mcbo/tasks/synthetic/maxsat/maxsat.py b/MCBO/mcbo/tasks/synthetic/maxsat/maxsat.py
+new file mode 100644
+index 0000000..607fde0
+--- /dev/null
++++ b/MCBO/mcbo/tasks/synthetic/maxsat/maxsat.py
+@@ -0,0 +1,150 @@
++# Adapted from Bounce (https://github.com/lpapenme/bounce), MIT License.
++
++import os
++import pathlib
++from typing import List, Dict, Any
++
++import torch
++import pandas as pd
++import numpy as np
++
++from mcbo.tasks import TaskBase
++from mcbo.tasks.synthetic.maxsat.utils_maxsat import (
++    WCNF,
++    MAXSAT_DIR,
++    download_maxsat60_data,
++    download_maxsat125_data,
++)
++
++
++class MaxSat(TaskBase):
++    """
++    A MaxSat benchmark (this class will be subclassed for each MaxSat instance)
++    """
++
++    categories = ["OFF", "ON"]
++
++    def __init__(
++        self,
++        instance_filename: str,
++        normalize_weights: bool = True,
++        negative_weights: bool = False,
++    ):
++        """
++        Initialize the benchmark function.
++
++        Args:
++            instance_filename: the filename of the MaxSat instance
++            normalize_weights: whether to normalize the weights to zero mean and unit standard deviation
++            negative_weights: whether to use the negative weights (i.e. the weights of the unsatisfied clauses)
++        """
++        super(MaxSat, self).__init__()
++
++        wcnf = WCNF(
++            os.path.join(
++                MAXSAT_DIR, instance_filename
++            )
++        )
++        self.dim = wcnf.nv
++
++        self.normalize_weights = normalize_weights
++        self.negative_weights = negative_weights
++        self.weights = np.array(wcnf.weights, dtype=np.float64)
++        self.total_weight = self.weights.sum()
++
++        # normalize weights to zero mean and unit standard deviation
++        if self.normalize_weights:
++            self.weights = (self.weights - self.weights.mean()) / self.weights.std()
++        self.clauses = np.zeros((len(wcnf.clauses), self.dim), dtype=np.bool_)
++
++        self.clause_idxs = []
++        for i, clause in enumerate(wcnf.clauses):
++            clause_idxs = np.abs(np.array(clause)) - 1
++            self.clauses[i, clause_idxs] = np.array(clause) > 0
++            self.clause_idxs.append(clause_idxs)
++
++    def evaluate(self, x: pd.DataFrame) -> np.ndarray:
++        x = x.replace(["OFF", "ON"], [0, 1])
++        return self.evaluate_transformed(x.to_numpy())
++
++    def evaluate_transformed(self, x_idx: np.ndarray) -> np.ndarray:
++        """Evaluate a matrix of category indices."""
++        # int64 like in evaluate(), floats change the results in the last bits
++        x = np.asarray(x_idx).astype(np.int64).squeeze()
++
++        if x.ndim == 1:
++            x = x[np.newaxis, :]
++
++        x = x.astype(np.bool_)
++
++        fxs = []
++        for _x in x:
++            weights_sum = np.sum(
++                self.weights
++                * [
++                    np.any(np.equal(_x[ci], self.clauses[i, ci]))
++                    for i, ci in enumerate(self.clause_idxs)
++                ]
++            )
++            if self.negative_weights:
++                # weights of unsatisfied clauses
++                weight_diff = self.total_weight - weights_sum
++                fx = torch.tensor(weight_diff).unsqueeze(-1)
++            else:
++                fx = -torch.tensor(weights_sum).unsqueeze(-1)
++            fxs.append(fx)
++
++        fxs = torch.cat(fxs, dim=0).detach().cpu().numpy()
++        return fxs[:, None]
++
++    @staticmethod
++    def get_static_search_space_params(n_stages: int) -> List[Dict[str, Any]]:
++        params = []
++        for i in range(1, n_stages + 1):
++            params.append(
++                {
++                    "name": f"stage_{i}",
++                    "type": "nominal",
++                    "categories": MaxSat.categories,
++                }
++            )
++        return params
++
++    def get_search_space_params(self) -> List[Dict[str, Any]]:
++        return self.get_static_search_space_params(n_stages=self.dim)
++
++
++class MaxSat60(MaxSat):
++    """
++    The 60D MaxSat benchmark (see http://www.maxsat.udl.cat/11/benchmarks/index.html for more information)
++    """
++
++    @property
++    def name(self) -> str:
++        return "MaxSat 60"
++
++    def __init__(self, *args, **kwargs):
++        if not pathlib.Path(MAXSAT_DIR, "frb10-6-4.wcnf").exists():
++            download_maxsat60_data()
++        super().__init__(instance_filename="frb10-6-4.wcnf", *args, **kwargs)
++
++
++class MaxSat125(MaxSat):
++    """
++    The 125D MaxSat benchmark (see https://maxsat-evaluations.github.io/2018/benchmarks.html for more information)
++    """
++
++    @property
++    def name(self) -> str:
++        return "MaxSat 125"
++
++    def __init__(self, *args, **kwargs):
++        if not pathlib.Path(
++            MAXSAT_DIR, "cluster-expansion-IS1_5.0.5.0.0.5_softer_periodic.wcnf"
++        ).exists():
++            download_maxsat125_data()
++        super().__init__(
++            instance_filename="cluster-expansion-IS1_5.0.5.0.0.5_softer_periodic.wcnf",
++            *args,
++            **kwargs,
++        )
+diff --git a/MCBO/mcbo/tasks/synthetic/maxsat/utils_maxsat.py b/MCBO/mcbo/tasks/synthetic/maxsat/utils_maxsat.py
+new file mode 100644
+index 0000000..5d54c5d
+--- /dev/null
++++ b/MCBO/mcbo/tasks/synthetic/maxsat/utils_maxsat.py
+@@ -0,0 +1,130 @@
++# Adapted from Bounce (https://github.com/lpapenme/bounce), MIT License.
++
++import os
++import pathlib
++import logging
++
++# Where the MaxSAT instances are stored (independent of the working directory)
++MAXSAT_DIR = str(pathlib.Path(os.environ.get(
++    "MCBO_MAXSAT_DIR", pathlib.Path(__file__).resolve().parents[2] / "data" / "maxsat"
++)).expanduser().resolve()) + os.sep
++os.makedirs(MAXSAT_DIR, exist_ok=True)
++
++
++def download_maxsat60_data():
++    if not pathlib.Path(MAXSAT_DIR + "frb10-6-4.wcnf").exists():
++        logging.info("frb10-6-4.wcnf not found. Downloading...")
++
++        url = (
++            "http://bounce-resources.s3-website-us-east-1.amazonaws.com/wms_crafted.tgz"
++        )
++        logging.info(f"Downloading {url}")
++
++        import requests
++
++        response = requests.get(url, verify=False)
++
++        with open(MAXSAT_DIR + "wms_crafted.tgz", "wb") as file:
++            file.write(response.content)
++
++        import tarfile
++
++        with tarfile.open(MAXSAT_DIR + "wms_crafted.tgz", "r:gz") as tar:
++            tar.extractall(MAXSAT_DIR)
++            # move data/maxsat/wms_crafted/frb/frb10-6-4.wcnf to data/maxsat/frb10-6-4.wcnf
++            pathlib.Path(MAXSAT_DIR + "wms_crafted/frb/frb10-6-4.wcnf").rename(
++                MAXSAT_DIR + "frb10-6-4.wcnf"
++            )
++            # delete data/maxsat/wms_crafted (even though it is not empty)
++            import shutil
++
++            shutil.rmtree(MAXSAT_DIR + "wms_crafted")
++        # delete .tgz file
++        pathlib.Path(MAXSAT_DIR + "wms_crafted.tgz").unlink()
++        logging.info("Data extracted!")
++
++
++def download_maxsat125_data():
++    if not pathlib.Path(
++        MAXSAT_DIR + "cluster-expansion-IS1_5.0.5.0.0.5_softer_periodic.wcnf"
++    ).exists():
++        logging.info(
++            "cluster-expansion-IS1_5.0.5.0.0.5_softer_periodic.wcnf not found. Downloading..."
++        )
++        import requests
++
++        url = "http://bounce-resources.s3-website-us-east-1.amazonaws.com/mse18-new.zip"
++        logging.info(f"Downloading {url}")
++
++        response = requests.get(url, verify=False)
++
++        with open(MAXSAT_DIR + "ce.zip", "wb") as file:
++            file.write(response.content)
++
++        import zipfile
++
++        with zipfile.ZipFile(MAXSAT_DIR + "ce.zip", "r") as zip_ref:
++            zip_ref.extractall(MAXSAT_DIR)
++
++        # extract data/maxsat/mse18-new/cluster-expansion/benchmarks/IS1_5.0.5.0.0.5_softer_periodic.wcnf.gz
++        import gzip, shutil
++
++        with gzip.open(
++            MAXSAT_DIR + "mse18-new/cluster-expansion/benchmarks/IS1_5.0.5.0.0.5_softer_periodic.wcnf.gz",
++            "rb",
++        ) as f_in:
++            # save to data/maxsat/cluster-expansion-IS1_5.wcnf
++            with open(
++                MAXSAT_DIR + "cluster-expansion-IS1_5.0.5.0.0.5_softer_periodic.wcnf",
++                "wb",
++            ) as f_out:
++                shutil.copyfileobj(f_in, f_out)
++
++        shutil.rmtree(MAXSAT_DIR + "mse18-new")
++
++        # delete .zip file
++        pathlib.Path(MAXSAT_DIR + "ce.zip").unlink()
++        logging.info("Data extracted!")
++
++
++class WCNF:
++    """
++    Helper class for reading and parsing WCNF files. Works only for weighted CNF without constraints.
++
++    Attributes:
++        weights (list): List of weights for each clause.
++        clauses (list): List of clauses.
++        nv (int): Number of variables.
++    """
++
++    def __init__(self, file_path: str):
++        """
++        Constructor for WCNF class.
++
++        Args:
++            file_path: Path to the WCNF file.
++        """
++        file_name = pathlib.Path(file_path).name
++        file_path = os.path.join(MAXSAT_DIR, file_name)
++
++        weights = []
++        clauses = []
++
++        with open(file_path, "r") as f:
++            lines = f.readlines()
++            lines = [line.strip().replace("\n", " ") for line in lines]
++            lines = [
++                line.strip().split(" ")[:-1]
++                for line in lines
++                if line != "" and line[0] != "c" and line[0] != "p"
++            ]
++
++            for line in lines:
++                weight = int(line[0])
++                clause = [int(literal) for literal in line[1:] if len(literal) > 0]
++                weights.append(weight)
++                clauses.append(clause)
++
++            self.weights = weights
++            self.clauses = clauses
++            self.nv = max([abs(literal) for clause in clauses for literal in clause])
+diff --git a/MCBO/mcbo/tasks/synthetic/pest.py b/MCBO/mcbo/tasks/synthetic/pest.py
+index e7e67d0..0c52a09 100644
+--- a/MCBO/mcbo/tasks/synthetic/pest.py
++++ b/MCBO/mcbo/tasks/synthetic/pest.py
+@@ -94,7 +94,12 @@ class PestControl(TaskBase):
+ 
+     def evaluate(self, x: pd.DataFrame) -> np.ndarray:
+         x_ = x.replace(['do nothing', 'pesticide 1', 'pesticide 2', 'pesticide 3', 'pesticide 4'], [0, 1, 2, 3, 4])
+-        x_ = x_.to_numpy()
++        return self.evaluate_transformed(x_.to_numpy())
++
++    def evaluate_transformed(self, x_: np.ndarray) -> np.ndarray:
++        """Evaluate a matrix of category indices."""
++        # int64 like in evaluate(), floats change the results in the last bits
++        x_ = np.asarray(x_).astype(np.int64)
+         return np.array([self._compute(i) for i in x_])
+ 
+     def _compute(self, x):
+diff --git a/MCBO/mcbo/utils/experiment_utils.py b/MCBO/mcbo/utils/experiment_utils.py
+index 5fd86ca..c934b59 100644
+--- a/MCBO/mcbo/utils/experiment_utils.py
++++ b/MCBO/mcbo/utils/experiment_utils.py
+@@ -222,7 +222,7 @@ def get_task_from_id(task_id: str, **task_kwargs) -> TaskBase:
+         task_kwargs = {'designs_group_id': "sin", "operator_space_id": "basic", "objective": "both"}
+     elif task_id == 'antibody_design':
+         task_kwargs = {'num_cpus': 5, 'first_cpu': 0, 'absolut_dir': task_kwargs.get("absolut_dir")}
+-    elif task_id == 'pest':
++    elif task_id in ['pest', 'contamination', 'maxsat60', 'maxsat125', 'labs']:
+         task_kwargs = {}
+     else:
+         raise ValueError(task_id)

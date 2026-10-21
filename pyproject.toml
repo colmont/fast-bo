@@ -1,0 +1,43 @@
+[project]
+name = "fast-bo"
+version = "0.1.0"
+description = "Fast BO: Bayesian optimization through linear models."
+readme = "README.md"
+license = "MIT"
+# Pinned to the versions used for the paper
+requires-python = "==3.13.*"
+dependencies = [
+    "numpy==2.4.3",
+    "scipy==1.17.1",
+    "torch==2.11.0",
+    "botorch==0.17.2",
+    "gpytorch==1.15.2",
+    "linear-operator==0.6.1",
+    "jaxtyping==0.3.9",
+    "grpcio==1.70.0",
+    "protobuf==4.25.8",
+    "bencherscaffold",
+]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["fast_bo"]
+
+[tool.uv.sources]
+bencherscaffold = { git = "https://github.com/lpapenme/BencherScaffold", rev = "c119035a059cf34c82c3183fa53634070df3a3d6" }
+# The paper ran the CUDA 12.8 build on Linux (on CPU)
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"

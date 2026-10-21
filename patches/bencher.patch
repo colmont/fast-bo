@@ -1,0 +1,37 @@
+diff --git a/MujocoBenchmarks/src/mujocobenchmarks/functions.py b/MujocoBenchmarks/src/mujocobenchmarks/functions.py
+index 61cd44a..7e9fe63 100644
+--- a/MujocoBenchmarks/src/mujocobenchmarks/functions.py
++++ b/MujocoBenchmarks/src/mujocobenchmarks/functions.py
+@@ -43,12 +43,13 @@ class ObjectFactory(Generic[T]):
+ 
+ 
+ class MujucoPolicyFunc:
++    # One rollout per call, the client does the averaging
+     ANT_ENV: ClassVar[Tuple[str, float, float, int]] = ('Ant-v2', -1.0, 1.0, 1)
+-    SWIMMER_ENV: ClassVar[Tuple[str, float, float, int]] = ('Swimmer-v2', -1.0, 1.0, 5)
+-    HALF_CHEETAH_ENV: ClassVar[Tuple[str, float, float, int]] = ('HalfCheetah-v2', -1.0, 1.0, 5)
+-    HOPPER_ENV: ClassVar[Tuple[str, float, float, int]] = ('Hopper-v2', -1.4, 1.4, 5)
+-    WALKER_2D_ENV: ClassVar[Tuple[str, float, float, int]] = ('Walker2d-v2', -1.8, 0.9, 5)
+-    HUMANOID_ENV: ClassVar[Tuple[str, float, float, int]] = ('Humanoid-v2', -1.0, 1.0, 5)
++    SWIMMER_ENV: ClassVar[Tuple[str, float, float, int]] = ('Swimmer-v2', -1.0, 1.0, 1)
++    HALF_CHEETAH_ENV: ClassVar[Tuple[str, float, float, int]] = ('HalfCheetah-v2', -1.0, 1.0, 1)
++    HOPPER_ENV: ClassVar[Tuple[str, float, float, int]] = ('Hopper-v2', -1.4, 1.4, 1)
++    WALKER_2D_ENV: ClassVar[Tuple[str, float, float, int]] = ('Walker2d-v2', -1.8, 0.9, 1)
++    HUMANOID_ENV: ClassVar[Tuple[str, float, float, int]] = ('Humanoid-v2', -1.0, 1.0, 1)
+ 
+     ENV_CP = {
+         ANT_ENV[0]: 10.0,
+diff --git a/MujocoBenchmarks/src/mujocobenchmarks/main.py b/MujocoBenchmarks/src/mujocobenchmarks/main.py
+index 41b4187..3661643 100644
+--- a/MujocoBenchmarks/src/mujocobenchmarks/main.py
++++ b/MujocoBenchmarks/src/mujocobenchmarks/main.py
+@@ -122,6 +122,9 @@ class MujocoServiceServicer(DualStackGRCPService):
+             # MuJoCo benchmark non-reproducible while lunarlander looked fine.
+             return -float(spec['factory']()(x, seed=seed)[0].squeeze())
+ 
++        if seed is not None:
++            # Seed the episode the same way as the MuJoCo rollouts
++            seed = int(np.random.SeedSequence(seed).spawn(1)[0].generate_state(1)[0])
+         return -self._lunarlander_reward(x.squeeze(), seed=seed)
+ 
+     @staticmethod
