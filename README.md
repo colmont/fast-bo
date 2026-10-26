@@ -1,7 +1,7 @@
 # Fast BO
 
 Code for the paper *Fast Bayesian Optimization Through Linear Models* by Colin Doumont,
-Henry Moss and Philipp Hennig (arXiv link to follow).
+Henry Moss and Philipp Hennig ([arXiv:2610.29580](https://arxiv.org/abs/2610.29580)).
 
 The code for continuous problems is in `fast_bo/`. For categorical problems we patch
 MCBO (`patches/mcbo.patch`).
@@ -53,7 +53,7 @@ The LABS, MaxSAT and Contamination tasks are adapted from
 @article{doumont2026fast,
   title   = {Fast {B}ayesian Optimization Through Linear Models},
   author  = {Doumont, Colin and Moss, Henry and Hennig, Philipp},
-  journal = {arXiv preprint arXiv:XXXX.XXXXX},
+  journal = {arXiv preprint arXiv:2610.29580},
   year    = {2026},
 }
 ```
